@@ -1,0 +1,124 @@
+name: Build Bar Ops
+
+# Build Electron de Bar Ops. Tourne ici (dépôt public) parce que les runners macOS
+# y sont gratuits ; le code source reste dans SPECTRE888/bar-ops (privé), lu avec
+# une clé de déploiement en lecture seule. Déclenché par la CI de bar-ops à chaque tag.
+on:
+  repository_dispatch:
+    types: [build]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag de bar-ops à builder (ex. v1.5.227)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Check tag
+      run: |
+        [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "❌ Tag invalide : $TAG"; exit 1; }
+        echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+    - name: Checkout bar-ops (privé)
+      uses: actions/checkout@v4
+      with:
+        repository: SPECTRE888/bar-ops
+        ref: ${{ env.TAG }}
+        ssh-key: ${{ secrets.BAR_OPS_DEPLOY_KEY }}
+        persist-credentials: false
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Clean existing release
+      continue-on-error: true
+      run: gh release delete "$TAG" --yes --cleanup-tag --repo SPECTRE888/bar-ops-releases
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Build Electron app
+      run: npx electron-builder --mac --arm64 --publish=never
+      env:
+        CSC_IDENTITY_AUTO_DISCOVERY: false
+
+    - name: List dist output
+      run: ls -lh dist/ || true
+
+    - name: Build PKG installer
+      run: |
+        APP_PATH="dist/mac-arm64/Bar Ops.app"
+
+        # Signer l'app en ad-hoc avant packaging
+        codesign --force --deep --sign - --timestamp=none "$APP_PATH"
+
+        # Créer le PKG (nom sans espace)
+        pkgbuild \
+          --root "dist/mac-arm64" \
+          --install-location "/Applications" \
+          --scripts "scripts/pkg" \
+          --identifier "com.barops.app" \
+          --version "$VERSION" \
+          "dist/BarOps-${VERSION}-Installer.pkg"
+
+        echo "✅ PKG créé: dist/BarOps-${VERSION}-Installer.pkg"
+
+    - name: Sign update ZIP
+      run: node scripts/sign-update.js "dist/BarOps-${VERSION}-arm64-mac.zip"
+      env:
+        UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+
+    - name: Create release & upload assets
+      run: |
+        echo "=== dist/ contents ==="
+        ls -lh dist/
+
+        # Le ZIP et sa signature sont obligatoires : sans eux, l'auto-updater refuse la mise à jour
+        for f in "dist/BarOps-${VERSION}-arm64-mac.zip" "dist/BarOps-${VERSION}-arm64-mac.zip.sig"; do
+          [ -f "$f" ] || { echo "❌ Missing (obligatoire): $f"; exit 1; }
+        done
+
+        # Collecter uniquement les fichiers qui existent
+        FILES=()
+        for f in \
+          "dist/BarOps-${VERSION}-Installer.pkg" \
+          "dist/BarOps-${VERSION}-arm64-mac.zip" \
+          "dist/BarOps-${VERSION}-arm64-mac.zip.sig" \
+          "dist/BarOps-${VERSION}-arm64-mac.zip.blockmap" \
+          "dist/BarOps-${VERSION}-arm64-mac.dmg" \
+          "dist/BarOps-${VERSION}-arm64-mac.dmg.blockmap" \
+          "dist/latest-mac.yml"
+        do
+          if [ -f "$f" ]; then
+            FILES+=("$f")
+            echo "✅ Found: $f"
+          else
+            echo "⚠️  Missing: $f"
+          fi
+        done
+
+        gh release create "$TAG" \
+          --repo SPECTRE888/bar-ops-releases \
+          --title "$TAG" \
+          --notes "Bar Ops ${TAG}" \
+          "${FILES[@]}"
+      env:
+        GH_TOKEN: ${{ github.token }}
